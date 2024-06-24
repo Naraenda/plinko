@@ -20,10 +20,8 @@
 #include <string>
 #include <vector>
 
-
 // char list is faster than compute
-__device__ constexpr char chars[] =
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+__device__ constexpr char chars[] = "0123456789abcdef";
 
 __device__ constexpr uint32_t k[64]{
     0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1,
@@ -82,14 +80,12 @@ template <uint32_t size> struct alignas(size) byte_arr_t {
     __device__ __host__ inline byte_arr_t() {}
 
     __device__ __host__ inline byte_arr_t(const uint8_t value) {
-#pragma unroll
         for (uint_fast8_t i = 0; i < num_bytes; ++i) {
             bytes[i] = value;
         }
     }
 
     __device__ __host__ inline byte_arr_t(const byte_arr_t &other) {
-#pragma unroll
         for (uint_fast8_t i = 0; i < num_ints; ++i) {
             ints[i] = other.ints[i];
         }
@@ -102,16 +98,10 @@ template <uint32_t size> struct alignas(size) byte_arr_t {
 
     __device__ __host__ static inline bool less(const byte_arr_t &a,
                                                 const byte_arr_t &b) {
-#pragma unroll
-        // for (uint_fast8_t i = 0; i < num_ints; ++i) {
-        //     if (a.ints[i] == b.ints[i])
-        //         continue;
-        //     return a.ints[i] < b.ints[i];
-        // }
-        for (uint_fast16_t i = 0; i < num_bytes; ++i) {
-            if (a.bytes[i] == b.bytes[i])
+        for (uint_fast8_t i = 0; i < num_ints; ++i) {
+            if (a.ints[i] == b.ints[i])
                 continue;
-            return a.bytes[i] < b.bytes[i];
+            return a.ints[i] < b.ints[i];
         }
         return false;
     }
@@ -121,7 +111,6 @@ template <uint32_t size> struct alignas(size) byte_arr_t {
     }
 
     __device__ __host__ inline bool operator==(const byte_arr_t &other) const {
-#pragma unroll
         for (uint32_t i = 0; i < num_ints; ++i) {
             if (ints[i] != other.ints[i])
                 return false;
@@ -129,8 +118,7 @@ template <uint32_t size> struct alignas(size) byte_arr_t {
         return true;
     }
 
-    __device__ __host__ inline void flip_endianness() {
-#pragma unroll
+    __device__ inline void flip_endianness() {
         for (uint32_t i = 0; i < num_ints; ++i) {
             ints[i] = __byte_perm(ints[i], 0, 0x0123);
         }
@@ -157,6 +145,9 @@ struct message_t : byte_arr_t<64> {
             bytes[i] = 0;
         }
         bytes[byte_length] = 0x80;
+
+        // ints[15] = bit_length;
+        // ints[14] = bit_length >> 32;
 
         for (uint32_t i = 0; i < 8; ++i) {
             bytes[63 - i] = bit_length >> (8 * i);
@@ -189,10 +180,10 @@ struct sha256_solver {
         }
     }
 
-    template <uint32_t r> __device__ void expand(const message_t &m) {
+    template <uint32_t r> __device__ void expand(const message_t &message) {
         constexpr uint32_t j = r % 16;
         if (r < 16) {
-            w0[j] = __byte_perm(m.ints[j], 0, 0x0123);
+            w0[j] = message.ints[j];
         } else {
             const auto w_ = [&](auto i) {
                 return i < 32 ? w0[i % 16] : w[i % 16];
@@ -225,7 +216,7 @@ struct sha256_solver {
     __device__ void get(hash_t &hash) {
         for (uint_fast8_t i = 0; i < 8; ++i) {
             uint32_t sum = hash0[i] + z[i];
-            hash.ints[i] = __byte_perm(sum, 0, 0x0123);
+            hash.ints[i] = sum;
         }
     }
 };
@@ -243,6 +234,7 @@ __launch_bounds__(block_size) __global__
 
     message_t local_data;
     message_t candidate_data = global_data[0];
+    candidate_data.flip_endianness();
 
     // we can pre compute some of the expanded 'w'
     // and a few hash rounds if we limit the values
@@ -276,12 +268,9 @@ __launch_bounds__(block_size) __global__
     // backup solver state
     uint32_t w1[32];
     uint32_t z1[8];
-    for (uint_fast8_t i = 0; i < 32; ++i) {
-        w1[i] = solver.w[i];
-    }
-    for (uint_fast8_t i = 0; i < 8; ++i) {
-        z1[i] = solver.z[i];
-    }
+
+    for (uint_fast8_t i = 0; i < 32; ++i) { w1[i] = solver.w[i]; }
+    for (uint_fast8_t i = 0; i < 8; ++i) { z1[i] = solver.z[i]; }
 
     // brute force loop
     for (uint32_t i = 0; i < hashes_per_thread; ++i) {
@@ -294,7 +283,7 @@ __launch_bounds__(block_size) __global__
         } payload;
 
         for (uint_fast8_t i = 0; i < 8; ++i) {
-            payload.bytes[i] = chars[(thread_offset >> (4 * i)) % 0b1111];
+            payload.bytes[i] = chars[(thread_offset >> (4 * i)) % 16];
         }
 
         candidate_data.ints[7] = payload.ints[0];
@@ -319,12 +308,8 @@ __launch_bounds__(block_size) __global__
         }
 
         // rollback solver
-        for (uint_fast8_t i = 0; i < 32; ++i) {
-            solver.w[i] = w1[i];
-        }
-        for (uint_fast8_t i = 0; i < 8; ++i) {
-            solver.z[i] = z1[i];
-        }
+        for (uint_fast8_t i = 0; i < 32; ++i) { solver.w[i] = w1[i]; }
+        for (uint_fast8_t i = 0; i < 8; ++i) { solver.z[i] = z1[i]; }
     }
 
     using hash_reduce_t = cub::BlockReduce<hash_t, block_size>;
@@ -342,6 +327,7 @@ __launch_bounds__(block_size) __global__
 
     if (best_shared_hash == local_hash) {
         global_hash[block_id] = local_hash;
+        local_data.flip_endianness();
         global_data[block_id] = local_data;
     }
 }
@@ -435,9 +421,9 @@ int32_t main() {
                   << "best   : " << best_message.as_string(message_size) << "\n"
                   << "offset : " << offset << "\n"
                   << "         ";
-        for (uint32_t j = 0; j < sizeof(hash_t); ++j) {
-            std::cout << std::hex << std::setw(2) << std::setfill('0')
-                      << uint32_t{best_hash.bytes[j]};
+        for (uint32_t j = 0; j < hash_t::num_ints; ++j) {
+            std::cout << std::hex << std::setw(8) << std::setfill('0')
+                      << best_hash.ints[j];
         }
         std::cout << "\n" << std::endl;
     }
