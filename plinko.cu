@@ -351,12 +351,13 @@ __launch_bounds__(block_size) __global__
     }
 }
 
-std::string return_current_time_and_date() {
-    auto now       = std::chrono::system_clock::now();
-    auto in_time_t = std::chrono::system_clock::to_time_t(now);
+std::string get_timestamp() {
+    uint64_t ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                      std::chrono::system_clock::now().time_since_epoch())
+                      .count();
 
     std::stringstream ss;
-    ss << std::put_time(std::gmtime(&in_time_t), "%Y%m%dT%H%M%S");
+    ss << std::setfill('0') << std::setw(22) << ms;
     return ss.str();
 }
 
@@ -364,9 +365,10 @@ static_assert(sizeof(hash_t) == 32, "hash_t must be 32 bytes");
 static_assert(sizeof(message_t) == 64, "message_t must be 64 bytes");
 
 int32_t main() {
+
     std::string mask =
-        // name/nonce               /RESERVED/  /yyyymmddTHHMMSS
-        "Naraenda/trans-rights/uwu/+/________/++/_______________";
+        // name/nonce               /RESERVED/TIMESTAMP
+        "Naraenda/trans-rights/uwu/+/________/__________________";
 
     message_t message('/');
     std::copy(mask.begin(), mask.end(), message.bytes);
@@ -375,8 +377,8 @@ int32_t main() {
 
     std::cout << message.as_string(message_size) << std::endl;
 
-    constexpr uint32_t grid_size   = 256;
-    constexpr uint32_t block_size  = 256;
+    constexpr uint32_t grid_size  = 256;
+    constexpr uint32_t block_size = 256;
 
     // 8 characters that are each hexadecimal
     constexpr size_t thread_size = 0x1'0000'0000 / grid_size / block_size;
@@ -398,10 +400,11 @@ int32_t main() {
 
     hash_t    best_hash{0xff};
     message_t best_message{'?'};
-    while(true) {
+    while (true) {
         { // write time stamp
-            auto timestamp = return_current_time_and_date();
-            std::copy(timestamp.begin(), timestamp.end(), message.bytes + 40);
+            auto timestamp = get_timestamp();
+            std::copy(timestamp.end() - 18, timestamp.end(),
+                      message.bytes + 37);
             message.pad(message_size);
             cudaMemcpy(d_messages, message.bytes, sizeof(message_t),
                        cudaMemcpyHostToDevice);
