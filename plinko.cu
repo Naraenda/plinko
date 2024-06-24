@@ -103,10 +103,15 @@ template <uint32_t size> struct alignas(size) byte_arr_t {
     __device__ __host__ static inline bool less(const byte_arr_t &a,
                                                 const byte_arr_t &b) {
 #pragma unroll
-        for (uint_fast8_t i = 0; i < num_ints; ++i) {
-            if (a.ints[i] == b.ints[i])
+        // for (uint_fast8_t i = 0; i < num_ints; ++i) {
+        //     if (a.ints[i] == b.ints[i])
+        //         continue;
+        //     return a.ints[i] < b.ints[i];
+        // }
+        for (uint_fast16_t i = 0; i < num_bytes; ++i) {
+            if (a.bytes[i] == b.bytes[i])
                 continue;
-            return a.ints[i] < b.ints[i];
+            return a.bytes[i] < b.bytes[i];
         }
         return false;
     }
@@ -227,8 +232,7 @@ struct sha256_solver {
 
 template <uint32_t block_size, uint32_t hashes_per_thread>
 __launch_bounds__(block_size) __global__
-    void plinko(hash_t *global_hash, message_t *global_data,
-                size_t global_offset = 0) {
+    void plinko(hash_t *global_hash, message_t *global_data) {
     const uint32_t thread_id         = threadIdx.x;
     const uint32_t block_id          = blockIdx.x;
     const uint32_t threads_per_block = blockDim.x;
@@ -253,11 +257,10 @@ __launch_bounds__(block_size) __global__
     // 20 |     x   x x   . .         x
     // 21 |       x   x x . .           x
     // =========== MUTATE 7 8 ================
-    //  7 |               x .
-    //  8 |               . x
-    // 20 |     x   x x   7 8          x
+    //  7 |               x .   required for sha
+    //  8 |               . x   round 7 and 8
     //
-    // we can only do 5 sha rounds though :(
+    // we can only do 6 sha rounds though :(
     //
     // 2 ints at index 7, 8
     // search space is 2^32 different hashes
@@ -291,7 +294,7 @@ __launch_bounds__(block_size) __global__
         } payload;
 
         for (uint_fast8_t i = 0; i < 8; ++i) {
-            payload.bytes[i] = chars[(thread_offset >> (6 * i)) % 64];
+            payload.bytes[i] = chars[(thread_offset >> (4 * i)) % 0b1111];
         }
 
         candidate_data.ints[7] = payload.ints[0];
@@ -327,16 +330,18 @@ __launch_bounds__(block_size) __global__
     using hash_reduce_t = cub::BlockReduce<hash_t, block_size>;
     __shared__ typename hash_reduce_t::TempStorage reduce_storage;
 
-    auto best_hash =
+    auto best_local_hash =
         hash_reduce_t{reduce_storage}.Reduce(local_hash, hash_t::min);
 
+    __shared__ hash_t best_shared_hash;
     if (thread_id == 0) {
-        global_hash[block_id] = best_hash;
+        best_shared_hash = best_local_hash;
     }
 
     __syncthreads();
 
-    if (global_hash[block_id] == local_hash) {
+    if (best_shared_hash == local_hash) {
+        global_hash[block_id] = local_hash;
         global_data[block_id] = local_data;
     }
 }
@@ -397,7 +402,7 @@ int32_t main() {
         }
 
         plinko<block_size, thread_size>
-            <<<grid_size, block_size>>>(d_hashes, d_messages, offset);
+            <<<grid_size, block_size>>>(d_hashes, d_messages);
 
         cudaMemcpy(h_messages.data(), d_messages, sizeof(message_t) * grid_size,
                    cudaMemcpyDeviceToHost);
