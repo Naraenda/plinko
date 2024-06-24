@@ -1,1 +1,1 @@
-nvcc .\plinko.cu --resource-usage --std=c++17
+nvcc .\plinko.cu --resource-usage --std=c++17 --run

@@ -3,8 +3,6 @@
 
 #include <cub/block/block_reduce.cuh>
 #include <cuda/std/bit>
-#include <cuda/std/cstddef>
-#include <cuda/std/cstdint>
 
 #include <algorithm>
 #include <chrono>
@@ -37,9 +35,9 @@ __device__ constexpr uint32_t k[64]{
     0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
 };
 
-__device__ constexpr uint32_t hash0[8]{0x6a09e667, 0xbb67ae85, 0x3c6ef372,
-                                       0xa54ff53a, 0x510e527f, 0x9b05688c,
-                                       0x1f83d9ab, 0x5be0cd19};
+__device__ constexpr uint32_t h0[8]{0x6a09e667, 0xbb67ae85, 0x3c6ef372,
+                                    0xa54ff53a, 0x510e527f, 0x9b05688c,
+                                    0x1f83d9ab, 0x5be0cd19};
 
 __device__ inline uint32_t ch(uint32_t x, uint32_t y, uint32_t z) {
     return (x & y) ^ (~x & z);
@@ -146,9 +144,6 @@ struct message_t : byte_arr_t<64> {
         }
         bytes[byte_length] = 0x80;
 
-        // ints[15] = bit_length;
-        // ints[14] = bit_length >> 32;
-
         for (uint32_t i = 0; i < 8; ++i) {
             bytes[63 - i] = bit_length >> (8 * i);
         }
@@ -176,7 +171,7 @@ struct sha256_solver {
 
     __device__ void init() {
         for (uint_fast8_t i = 0; i < 8; ++i) {
-            z[i] = hash0[i];
+            z[i] = h0[i];
         }
     }
 
@@ -215,7 +210,7 @@ struct sha256_solver {
 
     __device__ void get(hash_t &hash) {
         for (uint_fast8_t i = 0; i < 8; ++i) {
-            uint32_t sum = hash0[i] + z[i];
+            uint32_t sum = h0[i] + z[i];
             hash.ints[i] = sum;
         }
     }
@@ -269,13 +264,18 @@ __launch_bounds__(block_size) __global__
     uint32_t w1[32];
     uint32_t z1[8];
 
-    for (uint_fast8_t i = 0; i < 32; ++i) { w1[i] = solver.w[i]; }
-    for (uint_fast8_t i = 0; i < 8; ++i) { z1[i] = solver.z[i]; }
+    for (uint_fast8_t i = 0; i < 32; ++i) {
+        w1[i] = solver.w[i];
+    }
+    for (uint_fast8_t i = 0; i < 8; ++i) {
+        z1[i] = solver.z[i];
+    }
 
     // brute force loop
     for (uint32_t i = 0; i < hashes_per_thread; ++i) {
-        size_t thread_offset =
-            i + (thread_id + block_id * threads_per_block) * hashes_per_thread;
+        const size_t global_thread_id =
+            thread_id + block_id * threads_per_block;
+        const size_t global_hash_id = i + global_thread_id * hashes_per_thread;
 
         union {
             uint32_t ints[2];
@@ -283,7 +283,7 @@ __launch_bounds__(block_size) __global__
         } payload;
 
         for (uint_fast8_t i = 0; i < 8; ++i) {
-            payload.bytes[i] = chars[(thread_offset >> (4 * i)) % 16];
+            payload.bytes[i] = chars[(global_hash_id >> (4 * i)) % 16];
         }
 
         candidate_data.ints[7] = payload.ints[0];
@@ -301,6 +301,14 @@ __launch_bounds__(block_size) __global__
         hash_t candidate_hash;
         solver.get(candidate_hash);
 
+#if DEBUG_KERNEL
+        printf("%3u,%10llu: %x%x%x%x%x%x%x%x\n", block_id, global_hash_id,
+               candidate_hash.ints[0], candidate_hash.ints[1],
+               candidate_hash.ints[2], candidate_hash.ints[3],
+               candidate_hash.ints[4], candidate_hash.ints[5],
+               candidate_hash.ints[6], candidate_hash.ints[7]);
+#endif
+
         // candidate is better
         if (candidate_hash < local_hash) {
             local_hash = candidate_hash;
@@ -308,8 +316,12 @@ __launch_bounds__(block_size) __global__
         }
 
         // rollback solver
-        for (uint_fast8_t i = 0; i < 32; ++i) { solver.w[i] = w1[i]; }
-        for (uint_fast8_t i = 0; i < 8; ++i) { solver.z[i] = z1[i]; }
+        for (uint_fast8_t i = 0; i < 32; ++i) {
+            solver.w[i] = w1[i];
+        }
+        for (uint_fast8_t i = 0; i < 8; ++i) {
+            solver.z[i] = z1[i];
+        }
     }
 
     using hash_reduce_t = cub::BlockReduce<hash_t, block_size>;
@@ -329,6 +341,13 @@ __launch_bounds__(block_size) __global__
         global_hash[block_id] = local_hash;
         local_data.flip_endianness();
         global_data[block_id] = local_data;
+
+#if DEBUG_KERNEL
+        printf("%3u,**********: %x%x%x%x%x%x%x%x\n", block_id,
+               local_hash.ints[0], local_hash.ints[1], local_hash.ints[2],
+               local_hash.ints[3], local_hash.ints[4], local_hash.ints[5],
+               local_hash.ints[6], local_hash.ints[7]);
+#endif
     }
 }
 
@@ -356,10 +375,11 @@ int32_t main() {
 
     std::cout << message.as_string(message_size) << std::endl;
 
-    constexpr uint32_t grid_size  = 256;
-    constexpr uint32_t block_size = 256;
-    constexpr size_t   thread_size =
-        size_t(64) * 64 * 64 * 64 * 64 * 64 / grid_size / block_size;
+    constexpr uint32_t grid_size   = 256;
+    constexpr uint32_t block_size  = 256;
+
+    // 8 characters that are each hexadecimal
+    constexpr size_t thread_size = 0x1'0000'0000 / grid_size / block_size;
 
     std::vector<hash_t>    h_hashes(grid_size, hash_t{0xff});
     std::vector<message_t> h_messages(grid_size, message);
@@ -378,7 +398,7 @@ int32_t main() {
 
     hash_t    best_hash{0xff};
     message_t best_message{'?'};
-    for (size_t offset = 0;; ++offset) {
+    while(true) {
         { // write time stamp
             auto timestamp = return_current_time_and_date();
             std::copy(timestamp.begin(), timestamp.end(), message.bytes + 40);
@@ -419,11 +439,10 @@ int32_t main() {
                   << " GH/sec\n"
                   << "input  : " << message.as_string(message_size) << "\n"
                   << "best   : " << best_message.as_string(message_size) << "\n"
-                  << "offset : " << offset << "\n"
                   << "         ";
         for (uint32_t j = 0; j < hash_t::num_ints; ++j) {
             std::cout << std::hex << std::setw(8) << std::setfill('0')
-                      << best_hash.ints[j];
+                      << best_hash.ints[j] << " ";
         }
         std::cout << "\n" << std::endl;
     }
