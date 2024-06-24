@@ -1,0 +1,7 @@
+IndentWidth: 4
+AlignConsecutiveAssignments: true
+AlignConsecutiveDeclarations: true
+AlignTrailingComments: true
+AlignOperands: true
+AlignAfterOpenBracket: true
+AlignConsecutiveMacros: true

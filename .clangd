@@ -1,0 +1,10 @@
+CompileFlags:
+  Add:
+    - --cuda-gpu-arch=sm_89
+    - --cuda-path=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.5
+    - -LC://Program Files//NVIDIA GPU Computing Toolkit//CUDA//v12.5//lib
+    - -IC://Program Files//NVIDIA GPU Computing Toolkit//CUDA//v12.5//include
+    - -std=c++17
+Diagnostics:
+  Suppress:
+    - attribute_aligned_too_great

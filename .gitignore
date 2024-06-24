@@ -1,0 +1,7 @@
+.vscode
+
+*.exe
+*.exp
+*.lib
+*.out
+*.txt
