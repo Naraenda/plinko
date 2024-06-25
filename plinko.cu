@@ -16,7 +16,6 @@
 #include <ostream>
 #include <sstream>
 #include <string>
-#include <vector>
 
 // char list is faster than compute
 __device__ constexpr char chars[] = "0123456789abcdef";
@@ -130,8 +129,7 @@ template <uint32_t size> struct alignas(size) byte_arr_t {
         return s;
     }
 
-    std::string as_hex_string()
-    {
+    std::string as_hex_string() {
         std::stringstream ss;
         for (uint32_t i = 0; i < num_ints; ++i) {
             ss << std::hex << std::setw(8) << std::setfill('0') << ints[i]
@@ -225,7 +223,8 @@ struct sha256_solver {
     }
 };
 
-template <uint32_t block_size, uint32_t hashes_per_thread, uint32_t slow_retries>
+template <uint32_t block_size, uint32_t hashes_per_thread,
+          uint32_t slow_retries>
 __launch_bounds__(block_size) __global__
     void plinko(hash_t *global_hash, message_t *global_data) {
     const uint32_t thread_id         = threadIdx.x;
@@ -240,8 +239,8 @@ __launch_bounds__(block_size) __global__
     candidate_data.flip_endianness();
 
     sha256_solver solver;
-    for (uint_fast8_t slow_hash_id = 0; slow_hash_id < slow_retries; ++slow_hash_id) {
-        candidate_data.bytes[0x19] = chars[slow_hash_id];
+    for (uint_fast8_t k = 0; k < slow_retries; ++k) {
+        candidate_data.bytes[0x19] = chars[k];
 
         // we can pre compute some of the expanded 'w'
         // and a few hash rounds if we limit the values
@@ -309,14 +308,6 @@ __launch_bounds__(block_size) __global__
             hash_t candidate_hash;
             solver.get(candidate_hash);
 
-#if DEBUG_KERNEL
-            printf("%3u,%10llu: %x%x%x%x%x%x%x%x\n", block_id, global_hash_id,
-                   candidate_hash.ints[0], candidate_hash.ints[1],
-                   candidate_hash.ints[2], candidate_hash.ints[3],
-                   candidate_hash.ints[4], candidate_hash.ints[5],
-                   candidate_hash.ints[6], candidate_hash.ints[7]);
-#endif
-
             // candidate is better
             if (candidate_hash < local_hash) {
                 local_hash = candidate_hash;
@@ -350,13 +341,6 @@ __launch_bounds__(block_size) __global__
         global_hash[block_id] = local_hash;
         local_data.flip_endianness();
         global_data[block_id] = local_data;
-
-#if DEBUG_KERNEL
-        printf("%3u,**********: %x%x%x%x%x%x%x%x\n", block_id,
-               local_hash.ints[0], local_hash.ints[1], local_hash.ints[2],
-               local_hash.ints[3], local_hash.ints[4], local_hash.ints[5],
-               local_hash.ints[6], local_hash.ints[7]);
-#endif
     }
 }
 
@@ -365,7 +349,7 @@ std::string get_timestamp() {
     // Convert to time_t which is a time point
     std::time_t now_time_t = std::chrono::system_clock::to_time_t(now);
     // Convert to tm structure
-    std::tm now_tm = *std::localtime(&now_time_t);
+    std::tm           now_tm = *std::gmtime(&now_time_t);
     std::stringstream ss;
     ss << std::put_time(&now_tm, "%y-%m-%d/%H+%M+%S/");
     return ss.str();
@@ -374,68 +358,54 @@ std::string get_timestamp() {
 static_assert(sizeof(hash_t) == 32, "hash_t must be 32 bytes");
 static_assert(sizeof(message_t) == 64, "message_t must be 64 bytes");
 
-int32_t main() {
-    std::string mask =
-        // name/nonce               /RESERVED/yy-mm-dd/hh+dd+ssZ
-        "Naraenda/trans-rights/uwu/+/________/__________________";
-    //   0123456789abcdef0123456789abcdef0123456789abcdef0123456
+struct plinko_box {
+    static constexpr uint32_t grid_size    = 256;
+    static constexpr uint32_t block_size   = 512;
+    static constexpr uint32_t slow_retries = 12;
+    static constexpr size_t   thread_size =
+        0x1'0000'0000 / grid_size / block_size;
 
-    message_t message('/');
-    std::copy(mask.begin(), mask.end(), message.bytes);
-    size_t message_size = 64 - 9;
-    mask.resize(message_size, '/');
+    static constexpr size_t message_size = 64 - 9;
 
-    std::cout << message.as_string(message_size) << std::endl;
-
-    constexpr uint32_t grid_size    = 256;
-    constexpr uint32_t block_size   = 512;
-    constexpr uint32_t slow_retries = 8;
-
-    // 8 characters that are each hexadecimal
-    constexpr size_t thread_size = 0x1'0000'0000 / grid_size / block_size;
-
-    std::vector<hash_t>    h_hashes(grid_size, hash_t{0xff});
-    std::vector<message_t> h_messages(grid_size, message);
-
-    message_t *d_messages;
+    message_t  seed_message;
+    message_t  best_message;
+    hash_t     best_hash;
+    hash_t     h_hashes[grid_size];
+    message_t  h_messages[grid_size];
     hash_t    *d_hashes;
+    message_t *d_messages;
 
-    cudaMalloc(&d_hashes, sizeof(hash_t) * grid_size);
-    cudaMalloc(&d_messages, sizeof(message_t) * grid_size);
+    cudaStream_t  stream;
+    std::ofstream log_file;
 
     std::chrono::time_point<std::chrono::high_resolution_clock> t_now =
         std::chrono::high_resolution_clock::now();
 
-    std::ofstream log_file;
-    log_file.open("results.txt", std::ios_base::app);
+    plinko_box &init(std::string mask) {
+        log_file.open("results.txt", std::ios_base::app);
 
-    hash_t    best_hash{0xff};
-    message_t best_message{'?'};
-    while (true) {
-        { // write time stamp
-            auto timestamp = get_timestamp();
-            std::copy(timestamp.end() - 18, timestamp.end(),
-                      message.bytes + 37);
-            message.pad(message_size);
-            cudaMemcpy(d_messages, message.bytes, sizeof(message_t),
-                       cudaMemcpyHostToDevice);
-        }
+        best_hash    = hash_t(0xff);
+        seed_message = message_t('0');
 
-        plinko<block_size, thread_size, slow_retries>
-            <<<grid_size, block_size>>>(d_hashes, d_messages);
+        std::copy(mask.begin(), mask.end(), seed_message.bytes);
 
-        cudaMemcpy(h_messages.data(), d_messages, sizeof(message_t) * grid_size,
-                   cudaMemcpyDeviceToHost);
-        cudaMemcpy(h_hashes.data(), d_hashes, sizeof(hash_t) * grid_size,
-                   cudaMemcpyDeviceToHost);
+        return *this;
+    }
 
+    void prepare_next() {
+        auto timestamp = get_timestamp();
+        std::copy(timestamp.begin(), timestamp.end(), seed_message.bytes + 37);
+        seed_message.pad(message_size);
+    }
+
+    void check_previous() {
         auto hash_candidate_ptr =
-            std::min_element(h_hashes.begin(), h_hashes.end(), hash_t::less);
+            std::min_element(h_hashes, h_hashes + grid_size, hash_t::less);
 
         if (*hash_candidate_ptr < best_hash) {
             best_hash = *hash_candidate_ptr;
             best_message =
-                h_messages[std::distance(h_hashes.begin(), hash_candidate_ptr)];
+                h_messages[std::distance(h_hashes, hash_candidate_ptr)];
             best_message.unpad(message_size);
 
             log_file << best_message.as_string(message_size) << "\n"
@@ -447,16 +417,60 @@ int32_t main() {
 
         float dt =
             static_cast<std::chrono::duration<float>>(t_now - t_prev).count();
-        size_t hashes_checked = slow_retries * block_size * grid_size * size_t{thread_size};
+        size_t hashes_checked =
+            slow_retries * block_size * grid_size * size_t{thread_size};
 
         std::cout << "\x1B[2J\x1B[H" << std::fixed << std::setw(11)
                   << std::setprecision(6) << hashes_checked / dt / 1e9
                   << " GH/sec\n"
-                  << "input  : " << message.as_string(message_size) << "\n"
+                  << "input  : " << seed_message.as_string(message_size) << "\n"
                   << "best   : " << best_message.as_string(message_size) << "\n"
                   << "         " << best_hash.as_hex_string() << std::endl;
     }
 
-    cudaFree(d_hashes);
-    cudaFree(d_messages);
+    void run() {
+        cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
+
+        cudaMallocAsync(&d_hashes, sizeof(hash_t) * grid_size, stream);
+        cudaMallocAsync(&d_messages, sizeof(message_t) * grid_size, stream);
+
+        cudaEvent_t results_ready;
+        cudaEventCreate(&results_ready);
+
+        prepare_next();
+        for (size_t i = 0;; ++i) {
+            // copy pure input to device
+            cudaMemcpyAsync(d_messages, &seed_message, sizeof(message_t),
+                            cudaMemcpyHostToDevice, stream);
+            // horse plinko
+            plinko<block_size, thread_size, slow_retries>
+                <<<grid_size, block_size, 0, stream>>>(d_hashes, d_messages);
+
+            // we are computing results on device, do stuff on host in parallel
+            if (i > 0) {
+                // wait for device results to be copied
+                cudaEventSynchronize(results_ready);
+                prepare_next();
+                check_previous();
+            }
+
+            // copy mutated input to host
+            cudaMemcpyAsync(h_messages, d_messages,
+                            sizeof(message_t) * grid_size,
+                            cudaMemcpyDeviceToHost);
+            // copy hashes to host
+            cudaMemcpyAsync(h_hashes, d_hashes, sizeof(hash_t) * grid_size,
+                            cudaMemcpyDeviceToHost);
+            // we need to know when results have been copied over
+            cudaEventRecord(results_ready, stream);
+        }
+    }
+};
+
+int32_t main() {
+    std::string mask =
+        "Naraenda/trans-rights/uwu/+/________/_________________/";
+    //     write your thingies here /RESERVED/yy-mm-dd/hh+dd+ss/
+    //   0123456789abcdef0123456789abcdef0123456789abcdef0123456
+    plinko_box{}.init(mask).run();
 }
