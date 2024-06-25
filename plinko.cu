@@ -407,7 +407,7 @@ int32_t main() {
         std::chrono::high_resolution_clock::now();
 
     std::ofstream log_file;
-    log_file.open("results.txt");
+    log_file.open("results.txt", std::ios_base::app);
 
     hash_t    best_hash{0xff};
     message_t best_message{'?'};
