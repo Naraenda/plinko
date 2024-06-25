@@ -2,7 +2,6 @@
 #include <driver_types.h>
 
 #include <cub/block/block_reduce.cuh>
-#include <cuda/std/bit>
 
 #include <algorithm>
 #include <chrono>
@@ -18,7 +17,7 @@
 #include <string>
 
 // char list is faster than compute
-__device__ constexpr char chars[] = "0123456789abcdef";
+__device__ constexpr char chars[] = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ+/";
 
 __align__(32) __device__ constexpr uint32_t k[64]{
     0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1,
@@ -47,7 +46,7 @@ __device__ inline uint32_t ma(uint32_t x, uint32_t y, uint32_t z) {
 }
 
 template <uint32_t shift> __device__ inline uint32_t rotr(uint32_t a) {
-    return cuda::std::rotr(a, shift);
+    return a >> (shift % 32) | a << (32 - (shift % 32));
 }
 
 template <uint32_t a, uint32_t b, uint32_t c>
@@ -164,10 +163,22 @@ struct message_t : byte_arr_t<64> {
     }
 };
 
-template <int First, int Last, typename Lambda>
-__device__ inline void static_for(Lambda const &f) {
-    if constexpr (First < Last) {
-        f(cuda::std::integral_constant<int, First>{});
+template<class T, T v>
+struct integral_constant
+{
+    static constexpr T value = v;
+    using value_type = T;
+    using type = integral_constant; // using injected-class-name
+    __host__ __device__ constexpr operator value_type() const noexcept { return value; }
+    __host__ __device__ constexpr value_type operator()() const noexcept { return value; } // since c++14
+};
+
+template <uint32_t First, uint32_t Last, typename Lambda>
+__device__ inline void static_for(Lambda const& f)
+{
+    if constexpr (First < Last)
+    {
+        f(integral_constant<uint32_t, First>{});
         static_for<First + 1, Last>(f);
     }
 }
@@ -224,7 +235,7 @@ struct sha256_solver {
 };
 
 template <uint32_t block_size, uint32_t hashes_per_thread,
-          uint32_t slow_retries>
+          uint32_t slow_retries, uint32_t fast_bits>
 __launch_bounds__(block_size) __global__
     void plinko(hash_t *global_hash, message_t *global_data) {
     const uint32_t thread_id         = threadIdx.x;
@@ -284,7 +295,7 @@ __launch_bounds__(block_size) __global__
 
         // brute force loop
         for (uint32_t i = 0; i < hashes_per_thread; ++i) {
-            const size_t global_hash_id =
+            const uint64_t global_hash_id =
                 i + global_thread_id * hashes_per_thread;
 
             union {
@@ -293,7 +304,7 @@ __launch_bounds__(block_size) __global__
             } payload;
 
             for (uint_fast8_t i = 0; i < 8; ++i) {
-                payload.bytes[i] = chars[(global_hash_id >> (4 * i)) % 16];
+                payload.bytes[i] = chars[(global_hash_id >> (fast_bits * i)) % 64];
             }
 
             candidate_data.ints[7] = payload.ints[0];
@@ -359,11 +370,16 @@ static_assert(sizeof(hash_t) == 32, "hash_t must be 32 bytes");
 static_assert(sizeof(message_t) == 64, "message_t must be 64 bytes");
 
 struct plinko_box {
+     // bits per character, increases compute time significantly
+    static constexpr uint32_t fast_bits = 4;
+     // static multiplier for the above, if increasing the above is too fast
+    static constexpr uint32_t thread_mult = 16;
+
     static constexpr uint32_t grid_size    = 256;
     static constexpr uint32_t block_size   = 512;
-    static constexpr uint32_t slow_retries = 12;
+    static constexpr uint32_t slow_retries = 1; // use this if you run out of thread size
     static constexpr size_t   thread_size =
-        0x1'0000'0000 / grid_size / block_size;
+        thread_mult * (1ULL << (fast_bits * 8)) / grid_size / block_size;
 
     static constexpr size_t message_size = 64 - 9;
 
@@ -417,8 +433,8 @@ struct plinko_box {
 
         float dt =
             static_cast<std::chrono::duration<float>>(t_now - t_prev).count();
-        size_t hashes_checked =
-            slow_retries * block_size * grid_size * size_t{thread_size};
+        uint64_t hashes_checked =
+            slow_retries * block_size * grid_size * uint64_t{thread_size};
 
         std::cout << "\x1B[2J\x1B[H" << std::fixed << std::setw(11)
                   << std::setprecision(6) << hashes_checked / dt / 1e9
@@ -438,12 +454,12 @@ struct plinko_box {
         cudaEventCreate(&results_ready);
 
         prepare_next();
-        for (size_t i = 0;; ++i) {
+        for (uint64_t i = 0;; ++i) {
             // copy pure input to device
             cudaMemcpyAsync(d_messages, &seed_message, sizeof(message_t),
                             cudaMemcpyHostToDevice, stream);
             // horse plinko
-            plinko<block_size, thread_size, slow_retries>
+            plinko<block_size, thread_size, slow_retries, fast_bits>
                 <<<grid_size, block_size, 0, stream>>>(d_hashes, d_messages);
 
             // we are computing results on device, do stuff on host in parallel
@@ -457,12 +473,13 @@ struct plinko_box {
             // copy mutated input to host
             cudaMemcpyAsync(h_messages, d_messages,
                             sizeof(message_t) * grid_size,
-                            cudaMemcpyDeviceToHost);
+                            cudaMemcpyDeviceToHost, stream);
             // copy hashes to host
             cudaMemcpyAsync(h_hashes, d_hashes, sizeof(hash_t) * grid_size,
-                            cudaMemcpyDeviceToHost);
+                            cudaMemcpyDeviceToHost, stream);
             // we need to know when results have been copied over
             cudaEventRecord(results_ready, stream);
+            cudaDeviceSynchronize();
         }
     }
 };
