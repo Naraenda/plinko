@@ -21,7 +21,7 @@
 // char list is faster than compute
 __device__ constexpr char chars[] = "0123456789abcdef";
 
-__device__ constexpr uint32_t k[64]{
+__align__(32) __device__ constexpr uint32_t k[64]{
     0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1,
     0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
     0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786,
@@ -35,9 +35,9 @@ __device__ constexpr uint32_t k[64]{
     0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
 };
 
-__device__ constexpr uint32_t h0[8]{0x6a09e667, 0xbb67ae85, 0x3c6ef372,
-                                    0xa54ff53a, 0x510e527f, 0x9b05688c,
-                                    0x1f83d9ab, 0x5be0cd19};
+__align__(32) __device__
+    constexpr uint32_t h0[8]{0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+                             0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19};
 
 __device__ inline uint32_t ch(uint32_t x, uint32_t y, uint32_t z) {
     return (x & y) ^ (~x & z);
@@ -129,6 +129,16 @@ template <uint32_t size> struct alignas(size) byte_arr_t {
             s.begin(), s.end(), [](auto x) { return x < 0 || x > 127; }, '?');
         return s;
     }
+
+    std::string as_hex_string()
+    {
+        std::stringstream ss;
+        for (uint32_t i = 0; i < num_ints; ++i) {
+            ss << std::hex << std::setw(8) << std::setfill('0') << ints[i]
+               << " ";
+        }
+        return ss.str();
+    }
 };
 
 using hash_t = byte_arr_t<32>;
@@ -200,8 +210,8 @@ struct sha256_solver {
 
         const uint32_t w_r = r < 16 ? w0[r % 16] : w[r % 16];
 
-        uint32_t t1 = e1(e) + ch(e, f, g) + k[r] + w_r;
-        uint32_t t2 = e0(a) + ma(a, b, c);
+        const uint32_t t1 = e1(e) + ch(e, f, g) + k[r] + w_r;
+        const uint32_t t2 = e0(a) + ma(a, b, c);
 
         h += t1;
         d += h;
@@ -210,117 +220,116 @@ struct sha256_solver {
 
     __device__ void get(hash_t &hash) {
         for (uint_fast8_t i = 0; i < 8; ++i) {
-            uint32_t sum = h0[i] + z[i];
-            hash.ints[i] = sum;
+            hash.ints[i] = h0[i] + z[i];
         }
     }
 };
 
-template <uint32_t block_size, uint32_t hashes_per_thread>
+template <uint32_t block_size, uint32_t hashes_per_thread, uint32_t slow_retries>
 __launch_bounds__(block_size) __global__
     void plinko(hash_t *global_hash, message_t *global_data) {
     const uint32_t thread_id         = threadIdx.x;
     const uint32_t block_id          = blockIdx.x;
     const uint32_t threads_per_block = blockDim.x;
+    const uint32_t global_thread_id  = thread_id + block_id * threads_per_block;
 
-    hash_t local_hash{0xff};
-
-    sha256_solver solver;
-
+    hash_t    local_hash{0xff};
     message_t local_data;
     message_t candidate_data = global_data[0];
+
     candidate_data.flip_endianness();
 
-    // we can pre compute some of the expanded 'w'
-    // and a few hash rounds if we limit the values
-    // we mutate for hash generation
-    //
-    //    |             w[_] (calculated via expand)
-    //  R | 0 1 2 3 4 5 6 7 8 9 a b c d e f
-    // 16 | x x           . . x         x
-    // 17 |   x x         . .   x         x
-    // 18 | x   x x       . .     x
-    // 19 |   x   x x     . .       x
-    // 20 |     x   x x   . .         x
-    // 21 |       x   x x . .           x
-    // =========== MUTATE 7 8 ================
-    //  7 |               x .   required for sha
-    //  8 |               . x   round 7 and 8
-    //
-    // we can only do 6 sha rounds though :(
-    //
-    // 2 ints at index 7, 8
-    // search space is 2^32 different hashes
-    // at 20GH/sec is like a few seconds
+    sha256_solver solver;
+    for (uint_fast8_t slow_hash_id = 0; slow_hash_id < slow_retries; ++slow_hash_id) {
+        candidate_data.bytes[0x19] = chars[slow_hash_id];
 
-    solver.init();
-    static_for<0, 21>([&](auto i) {
-        if constexpr (i < 7 || 9 <= i)
-            solver.expand<i>(candidate_data);
-    });
-    static_for<0, 7>([&](auto i) { solver.round<i>(); });
+        // we can pre compute some of the expanded 'w'
+        // and a few hash rounds if we limit the values
+        // we mutate for hash generation
+        //
+        //    |             w[_] (calculated via expand)
+        //  R | 0 1 2 3 4 5 6 7 8 9 a b c d e f
+        // 16 | x x           . . x         x
+        // 17 |   x x         . .   x         x
+        // 18 | x   x x       . .     x
+        // 19 |   x   x x     . .       x
+        // 20 |     x   x x   . .         x
+        // 21 |       x   x x . .           x
+        // =========== MUTATE 7 8 ================
+        //  7 |               x .   required for sha
+        //  8 |               . x   round 7 and 8
+        //
+        // we can only do 6 sha rounds though :(
+        //
+        // 2 ints at index 7, 8
+        // search space is 2^32 different hashes
+        // at 20GH/sec is like a few seconds
 
-    // backup solver state
-    uint32_t w1[32];
-    uint32_t z1[8];
+        solver.init();
+        static_for<0, 21>([&](auto i) {
+            if constexpr (i < 7 || 9 <= i)
+                solver.expand<i>(candidate_data);
+        });
+        static_for<0, 7>([&](auto i) { solver.round<i>(); });
 
-    for (uint_fast8_t i = 0; i < 32; ++i) {
-        w1[i] = solver.w[i];
-    }
-    for (uint_fast8_t i = 0; i < 8; ++i) {
-        z1[i] = solver.z[i];
-    }
+        // backup solver state
+        uint32_t w1[32];
+        uint32_t z1[8];
 
-    // brute force loop
-    for (uint32_t i = 0; i < hashes_per_thread; ++i) {
-        const size_t global_thread_id =
-            thread_id + block_id * threads_per_block;
-        const size_t global_hash_id = i + global_thread_id * hashes_per_thread;
-
-        union {
-            uint32_t ints[2];
-            uint8_t  bytes[8];
-        } payload;
-
+        for (uint_fast8_t i = 0; i < 32; ++i) {
+            w1[i] = solver.w[i];
+        }
         for (uint_fast8_t i = 0; i < 8; ++i) {
-            payload.bytes[i] = chars[(global_hash_id >> (4 * i)) % 16];
+            z1[i] = solver.z[i];
         }
 
-        candidate_data.ints[7] = payload.ints[0];
-        candidate_data.ints[8] = payload.ints[1];
+        // brute force loop
+        for (uint32_t i = 0; i < hashes_per_thread; ++i) {
+            const size_t global_hash_id =
+                i + global_thread_id * hashes_per_thread;
 
-        static_for<7, 9>([&](auto i) { solver.expand<i>(candidate_data); });
-        static_for<7, 16>([&](auto i) { solver.round<i>(); });
-        static_for<21, 32>([&](auto i) { solver.expand<i>(candidate_data); });
-        static_for<16, 32>([&](auto i) { solver.round<i>(); });
-        static_for<32, 48>([&](auto i) { solver.expand<i>(candidate_data); });
-        static_for<32, 48>([&](auto i) { solver.round<i>(); });
-        static_for<48, 64>([&](auto i) { solver.expand<i>(candidate_data); });
-        static_for<48, 64>([&](auto i) { solver.round<i>(); });
+            union {
+                uint32_t ints[2];
+                uint8_t  bytes[8];
+            } payload;
 
-        hash_t candidate_hash;
-        solver.get(candidate_hash);
+            for (uint_fast8_t i = 0; i < 8; ++i) {
+                payload.bytes[i] = chars[(global_hash_id >> (4 * i)) % 16];
+            }
+
+            candidate_data.ints[7] = payload.ints[0];
+            candidate_data.ints[8] = payload.ints[1];
+            static_for<7, 9>([&](auto i) { solver.expand<i>(candidate_data); });
+            static_for<7, 21>([&](auto i) { solver.round<i>(); });
+            static_for<21, 64>([&](auto i) {
+                solver.expand<i>(candidate_data);
+                solver.round<i>();
+            });
+
+            hash_t candidate_hash;
+            solver.get(candidate_hash);
 
 #if DEBUG_KERNEL
-        printf("%3u,%10llu: %x%x%x%x%x%x%x%x\n", block_id, global_hash_id,
-               candidate_hash.ints[0], candidate_hash.ints[1],
-               candidate_hash.ints[2], candidate_hash.ints[3],
-               candidate_hash.ints[4], candidate_hash.ints[5],
-               candidate_hash.ints[6], candidate_hash.ints[7]);
+            printf("%3u,%10llu: %x%x%x%x%x%x%x%x\n", block_id, global_hash_id,
+                   candidate_hash.ints[0], candidate_hash.ints[1],
+                   candidate_hash.ints[2], candidate_hash.ints[3],
+                   candidate_hash.ints[4], candidate_hash.ints[5],
+                   candidate_hash.ints[6], candidate_hash.ints[7]);
 #endif
 
-        // candidate is better
-        if (candidate_hash < local_hash) {
-            local_hash = candidate_hash;
-            local_data = candidate_data;
-        }
+            // candidate is better
+            if (candidate_hash < local_hash) {
+                local_hash = candidate_hash;
+                local_data = candidate_data;
+            }
 
-        // rollback solver
-        for (uint_fast8_t i = 0; i < 32; ++i) {
-            solver.w[i] = w1[i];
-        }
-        for (uint_fast8_t i = 0; i < 8; ++i) {
-            solver.z[i] = z1[i];
+            // rollback solver
+            for (uint_fast8_t i = 0; i < 32; ++i) {
+                solver.w[i] = w1[i];
+            }
+            for (uint_fast8_t i = 0; i < 8; ++i) {
+                solver.z[i] = z1[i];
+            }
         }
     }
 
@@ -352,12 +361,13 @@ __launch_bounds__(block_size) __global__
 }
 
 std::string get_timestamp() {
-    uint64_t ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                      std::chrono::system_clock::now().time_since_epoch())
-                      .count();
-
+    auto now = std::chrono::system_clock::now();
+    // Convert to time_t which is a time point
+    std::time_t now_time_t = std::chrono::system_clock::to_time_t(now);
+    // Convert to tm structure
+    std::tm now_tm = *std::localtime(&now_time_t);
     std::stringstream ss;
-    ss << std::setfill('0') << std::setw(22) << ms;
+    ss << std::put_time(&now_tm, "%y-%m-%d/%H+%M+%S/");
     return ss.str();
 }
 
@@ -365,10 +375,10 @@ static_assert(sizeof(hash_t) == 32, "hash_t must be 32 bytes");
 static_assert(sizeof(message_t) == 64, "message_t must be 64 bytes");
 
 int32_t main() {
-
     std::string mask =
-        // name/nonce               /RESERVED/TIMESTAMP
+        // name/nonce               /RESERVED/yy-mm-dd/hh+dd+ssZ
         "Naraenda/trans-rights/uwu/+/________/__________________";
+    //   0123456789abcdef0123456789abcdef0123456789abcdef0123456
 
     message_t message('/');
     std::copy(mask.begin(), mask.end(), message.bytes);
@@ -377,8 +387,9 @@ int32_t main() {
 
     std::cout << message.as_string(message_size) << std::endl;
 
-    constexpr uint32_t grid_size  = 256;
-    constexpr uint32_t block_size = 256;
+    constexpr uint32_t grid_size    = 256;
+    constexpr uint32_t block_size   = 512;
+    constexpr uint32_t slow_retries = 8;
 
     // 8 characters that are each hexadecimal
     constexpr size_t thread_size = 0x1'0000'0000 / grid_size / block_size;
@@ -410,7 +421,7 @@ int32_t main() {
                        cudaMemcpyHostToDevice);
         }
 
-        plinko<block_size, thread_size>
+        plinko<block_size, thread_size, slow_retries>
             <<<grid_size, block_size>>>(d_hashes, d_messages);
 
         cudaMemcpy(h_messages.data(), d_messages, sizeof(message_t) * grid_size,
@@ -427,7 +438,8 @@ int32_t main() {
                 h_messages[std::distance(h_hashes.begin(), hash_candidate_ptr)];
             best_message.unpad(message_size);
 
-            log_file << best_message.as_string(message_size) << std::endl;
+            log_file << best_message.as_string(message_size) << "\n"
+                     << best_hash.as_hex_string() << std::endl;
         }
 
         auto t_prev = t_now;
@@ -435,19 +447,14 @@ int32_t main() {
 
         float dt =
             static_cast<std::chrono::duration<float>>(t_now - t_prev).count();
-        size_t hashes_checked = block_size * grid_size * size_t{thread_size};
+        size_t hashes_checked = slow_retries * block_size * grid_size * size_t{thread_size};
 
         std::cout << "\x1B[2J\x1B[H" << std::fixed << std::setw(11)
                   << std::setprecision(6) << hashes_checked / dt / 1e9
                   << " GH/sec\n"
                   << "input  : " << message.as_string(message_size) << "\n"
                   << "best   : " << best_message.as_string(message_size) << "\n"
-                  << "         ";
-        for (uint32_t j = 0; j < hash_t::num_ints; ++j) {
-            std::cout << std::hex << std::setw(8) << std::setfill('0')
-                      << best_hash.ints[j] << " ";
-        }
-        std::cout << "\n" << std::endl;
+                  << "         " << best_hash.as_hex_string() << std::endl;
     }
 
     cudaFree(d_hashes);
