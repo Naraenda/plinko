@@ -17,7 +17,7 @@
 #include <string>
 
 // char list is faster than compute
-__device__ constexpr char chars[] = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ+/";
+__device__ constexpr char chars[] = "+0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ/";
 
 __align__(32) __device__ constexpr uint32_t k[64]{
     0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1,
@@ -235,7 +235,7 @@ struct sha256_solver {
 };
 
 template <uint32_t block_size, uint32_t hashes_per_thread,
-          uint32_t slow_retries, uint32_t fast_bits>
+          uint32_t slow_retries>
 __launch_bounds__(block_size) __global__
     void plinko(hash_t *global_hash, message_t *global_data) {
     const uint32_t thread_id         = threadIdx.x;
@@ -296,7 +296,7 @@ __launch_bounds__(block_size) __global__
         // brute force loop
         for (uint32_t i = 0; i < hashes_per_thread; ++i) {
             const uint64_t global_hash_id =
-                i + global_thread_id * hashes_per_thread;
+                i + global_thread_id * static_cast<uint64_t>(hashes_per_thread);
 
             union {
                 uint32_t ints[2];
@@ -304,7 +304,7 @@ __launch_bounds__(block_size) __global__
             } payload;
 
             for (uint_fast8_t i = 0; i < 8; ++i) {
-                payload.bytes[i] = chars[(global_hash_id >> (fast_bits * i)) % 64];
+                payload.bytes[i] = chars[(global_hash_id >> (6 * i)) % 64];
             }
 
             candidate_data.ints[7] = payload.ints[0];
@@ -370,16 +370,15 @@ static_assert(sizeof(hash_t) == 32, "hash_t must be 32 bytes");
 static_assert(sizeof(message_t) == 64, "message_t must be 64 bytes");
 
 struct plinko_box {
-     // bits per character, increases compute time significantly
-    static constexpr uint32_t fast_bits = 4;
-     // static multiplier for the above, if increasing the above is too fast
-    static constexpr uint32_t thread_mult = 16;
-
+    static constexpr uint64_t search_range = 16 * (1ULL << (4 * 8));
     static constexpr uint32_t grid_size    = 256;
     static constexpr uint32_t block_size   = 512;
-    static constexpr uint32_t slow_retries = 1; // use this if you run out of thread size
-    static constexpr size_t   thread_size =
-        thread_mult * (1ULL << (fast_bits * 8)) / grid_size / block_size;
+    static constexpr uint32_t slow_retries = 1; // use this if you run out of search range
+
+    static_assert(search_range <= (1ULL << 6 * 8),
+                  "search range must not be greater than all possible "
+                  "character combinations");
+    static constexpr size_t thread_size = search_range / grid_size / block_size;
 
     static constexpr size_t message_size = 64 - 9;
 
@@ -459,7 +458,7 @@ struct plinko_box {
             cudaMemcpyAsync(d_messages, &seed_message, sizeof(message_t),
                             cudaMemcpyHostToDevice, stream);
             // horse plinko
-            plinko<block_size, thread_size, slow_retries, fast_bits>
+            plinko<block_size, thread_size, slow_retries>
                 <<<grid_size, block_size, 0, stream>>>(d_hashes, d_messages);
 
             // we are computing results on device, do stuff on host in parallel
